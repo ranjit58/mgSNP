@@ -1,0 +1,195 @@
+---
+title: "RYGB-mgSNP"
+author: "Ranjit kumar"
+date: "3/23/2017"
+output: html_document
+---
+
+
+### Datasets and code repository
+1. HMP metagenomics data is obtained from repository at Amazon (https://aws.amazon.com/datasets/human-microbiome-project/). All gut samples (QC processed) available at amazon s3 were dwonloaded from location s3://human-microbiome-project/HHS/HMASM/WGS/stool/
+2. RYGB metagenomics data is obtained from 2 sources.
+  * Palleja et.al (PUBMED ID PMID: 27306058), downloaded from ftp://ftp.sra.ebi.ac.uk/vol1/ERA571/ERA571035/fastq/
+  * Data from UAB (deposited in NIH SRA as SRP100876 https://www.ncbi.nlm.nih.gov/Traces/study/?acc=SRP100876) and can be downloaded using SRA-toolkit.
+  
+The code repository used for analysis and processing of both metagenomics is available at https://github.com/ranjit58/mgSNP . 
+The documentation of the repository describes how to run large datasets in parallel mode on a cluster (Slurm). Briefly, here are the key steps that are performed on samples in mgSNP pipeline.
+  
+### Analysis steps (metagenomic rawdata to multisample VCF file)
+1. **Reference sequence**: 93 genomes genomes are selected (as described in paper) and concatenated to create a large reference sequence for alignment. It is available at mgSNP/reference/genomes_ref.fa.gz. The code for generating refereance sequence is avialable at mgSNP/reference/
+2. **QC** : The data from HMP and RYGB-Palleja dataset were already QC-filtered so was used as is. The QC was performed on RYGB-UAB dataset using Trimmomatic (expresion : ILLUMINACLIP:NexteraPE-PE.fa:2:30:10 CROP:100 SLIDINGWINDOW:50:20 MINLEN:50).
+3. **Alignment** : BWA-MEM algorithm from BWA was used for alignment of metagenomics data to the reference sequence.
+4. **Filter alignment** : Filter SAM file to exclude reads mapped on multiple location (XA: alernative hits) or if they are less than 95% similar.
+5. **SNP Calling** : GATK was used for multisample SNP calling. The scripts mgSNP_gatk.sh followed by run_mgSNP_gatk-SNP was used to creates VCF file for each sample. All VCFs are later merged using script run_mgSNP_gatk-GVCF.sh to create a multisample GVCF file.
+
+### Analysis of multisample VCF files to generate hdSNVs
+All longitudnal sample pairs were identified from the data and the SNP pattern from the VCF file is  used for calculating SNP based distance (hdSNVs : the count of genomic position where the variant (SNP) does not match in both sample).
+
+1. The VCFTools is used to extract SNP information from the multisample VCF file, to create a VCF file for two samples being compared as : vcftools --vcf multisample.vcf --keep sample_ids_to_keep --remove-indels --recode -c > sample_pair.vcf (provide sample_ids_to_keep file with two ids in two line)
+2. The program mgSNP_annotator.py is used to annotate the genomic loci as match/mismatch after comparision in two samples as : python mgSNP_annotator.py -i sample_pair.vcf -o sample_pair.ann
+3. Certain regions of the genome suffer with low depth, difficult to align and repetitive regions which has high number of false positive SNPs. So we use a window based method (length 1kb, non-overlapping) to exclude data from windows which have (depth <5 , coevrage <50%). Alongwith the number of genomic loci that were different the program also report window based similarity score (not used in current manuscript). The program mgSNP_windowmaker.py takes the annotated vcf file and calculate all information as described below.
+e.g. python mgSNP_windowmaker.py -i sample_pair.ann -o sample_pair.win -w WINDOW_SIZE -g GENOME_SIZE (provide genome size and window size). The result includes following information for the paired analysis in tab delimited format.
+
+```
+Minimum genome coverage for two sample
+WSS Score (percent identical windows)
+Total windows 
+Total good/usable windows
+Count of Identical windows
+Count of Non-identical windows
+Count of No SNP windows
+Same SNP loci
+Different SNP loci 01 (snp in sample2)
+Different SNP loci 10 (snp in sample1)
+```
+
+4. The sum of column "Different SNP loci 01" and "Different SNP loci 10" results in total number of genomic loci that were different in both samples (called as Hamming distance) and when divided by the genome length (in MB) to calculate hdSNVs (per megabase of genome).
+
+The github repository only contains method to calculate hdSNVs. The R script described below is used to compare hdSNVs data of HMP(hmp.txt) and RYGB(rygb.txt) datasets.
+
+### Analysis and comparision of hdSNVs data from HMP and RYGB
+The file rygb.txt (contains data from RYGB dataset) and hmp.txt (contains data from RYGB dataset) has 3 columns (Species name, sample pair and spmb (represents hamming distance per mb genome, now called hdSNvs). 
+
+#### Load libraries
+```{r warning=FALSE}
+library("reshape2")
+library("ggplot2")
+library("RColorBrewer") 
+```
+
+####load RYGB and HMP data
+```{r}
+data_pj<-read.table(file="rygb.txt",header=T,sep="\t",comment.char = "")
+data_hmp<-read.table(file="hmp.txt",header=F,sep="\t",comment.char = "")
+colnames(data_hmp) = c("species","pair","spmb")
+
+# convert spmb values in log as spmb2
+# take care of 0 (add small value 0.1) before log
+data_pj$spmb2= ifelse(data_pj$spmb == 0, log(0.1),log(data_pj$spmb))
+data_hmp$spmb2= ifelse(data_hmp$spmb == 0, log(0.1),log(data_hmp$spmb))
+
+#add column type in both dataset
+data_hmp$type = "HMP"
+data_pj$type = "GBP"
+
+# merge both datasets
+alldata = rbind(data_hmp,data_pj)
+
+# keep a copy of data
+alldata_backup = alldata
+```
+
+#### Categorize longitudnal RYGB sample pairs in different time-groups
+```{r}
+#remove samples S56 from HMP data as it is regarded as mislabeled sample. 
+remove_samples = grep("S56",alldata$pair)
+alldata = alldata[-remove_samples,]
+
+# categorize RYGB data into PRE-EARLY, EARLY-LATE, PRE-LATE
+alldata$type = ifelse(grepl(".*3MDR.*PRE",alldata$pair),"PRE-EARLY",alldata$type)
+alldata$type = ifelse(grepl(".*1Y.*PRE",alldata$pair),"PRE-LATE",alldata$type)
+alldata$type = ifelse(grepl(".*1Y.*3MDR",alldata$pair),"EARLY-LATE",alldata$type)
+alldata$type = ifelse(grepl(".*A.*B",alldata$pair),"PRE-EARLY",alldata$type)
+alldata$type = ifelse(grepl(".*B.*C",alldata$pair),"EARLY-LATE",alldata$type)
+alldata$type = ifelse(grepl(".*A.*C",alldata$pair),"PRE-LATE",alldata$type)
+alldata$type = factor(alldata$type,levels = c("HMP","PRE-EARLY","EARLY-LATE","PRE-LATE"),ordered = T)
+
+#rename species to remove underscore 
+alldata$species <- sub("_", " ", alldata$species)
+alldata$species <- sub("_", " ", alldata$species)
+alldata$species <- sub("sp", "sp.", alldata$species)
+```
+
+#### Plot pie chart for hdSNVs distribution in HMP and RYGB
+```{r}
+hmp=round(alldata[alldata$type == "HMP",c("spmb")],0)
+pj03=round(alldata[alldata$type == "PRE-EARLY",c("spmb")],0)
+pj31=round(alldata[alldata$type == "EARLY-LATE",c("spmb")],0)
+b=c(-Inf,5,10,50, Inf)
+l=c("0-5","6-10","11-50","51+")
+c=c(brewer.pal(4,"Set3"))
+#png("pie.png",width = 720, height = 480, units = "px", pointsize = 12)
+par(mfrow=c(1,3))
+pie(table(cut(hmp,breaks=b,labels=l)),col=c,edges = 1000,radius=1,clockwise = T, init.angle = 180,main="HMP" )
+pie(table(cut(pj03,breaks=b,labels=l)),col=c,edges = 1000,radius=1,clockwise = T, init.angle = 180, main="PRE-EARLY")
+pie(table(cut(pj31,breaks=b,labels=l)),col=c,edges = 1000,radius=1,clockwise = T, init.angle = 180, main="EARLY-LATE")
+```
+
+
+#### Subselect the dataset (select abundunt species) for further comparision
+```{r}
+# Filter species which are not very abundant in PRE-LATE data
+alldata4 = alldata[alldata$type == "PRE-LATE",]
+species = as.data.frame(aggregate(alldata4$species,by = list(alldata4$species), FUN=length))
+#select species if present atleast 2 times
+species2 = as.vector(species[species$x>1,1])
+
+# remove item where thereis no HMP data like Dorea
+species2 = species2[-9]
+
+alldata = alldata[alldata$species %in% species2,]
+###
+```
+
+#### Statistical test to identify if RYGB(PRE-LATE group) has higher hdSNVs compared to HMP. The output shows species and its p-values. The program selects species with p<0.05 followed by p <0.1 (for display purposes)
+```{r warning=FALSE,results=FALSE}
+list_species =NULL
+for (item in unique(alldata$species)){
+#for (item in c("Alistipes_onderdonkii")){ 
+  data = alldata[alldata$species == item & alldata$type %in% c("HMP","PRE-LATE"),]
+  data$type = as.factor(data$type)
+  cat(item," ")
+  if(length(unique(data$type)) >= 2) {
+    test = wilcox.test(data$spmb2 ~ data$type,alternative="less")
+    #test=kruskal.test(data$spmb2 ~ data$type)
+    cat(test$p.value)
+    if(test$p.value <= 0.05){
+      list_species = c(list_species,item)
+    }
+  }
+  cat("\n")
+}
+for (item in unique(alldata$species)){
+  #for (item in c("Alistipes_onderdonkii")){ 
+  data = alldata[alldata$species == item & alldata$type %in% c("HMP","PRE-LATE"),]
+  data$type = as.factor(data$type)
+  cat(item," ")
+  if(length(unique(data$type)) >= 2) {
+    test = wilcox.test(data$spmb2 ~ data$type,alternative="less")
+    #test=kruskal.test(data$spmb2 ~ data$type)
+    cat(test$p.value)
+    if(test$p.value >= 0.05 & test$p.value <= 0.1){
+      list_species = c(list_species,item)
+    }
+  }
+  cat("\n")
+}
+```
+
+#### Plot figures
+
+```{r}
+#Convert species as ordered levels for figure
+allspecies = as.vector(unique(alldata$species))
+list_species2 = allspecies[!(allspecies %in% list_species)]
+alldata$species <- factor(alldata$species, levels = c(rev(list_species2),rev(list_species)),order=T)
+
+# design color scheme based on median
+color_box = aggregate(. ~ species + type,alldata,median)
+alldata_box = merge(alldata,color_box,by.x=c("species","type"),by.y=c("species","type"))
+colnames(color_box) = c("species","type","pair","mspmb","mspmb2")
+colnames(alldata_box)[8] = "SNV"
+
+# plot the figure
+ggplot(alldata_box, aes(factor(species), spmb2.x)) + 
+  geom_boxplot(aes(fill = SNV),colour="black",outlier.colour = NA,lwd=0.2) +
+  #geom_jitter(size = 0.01,alpha = 0.4) + 
+  theme(text = element_text(size=8),axis.text.y = element_text(face="italic",angle=0,colour = "black",size=8),axis.text.x = element_text(angle=90,colour = "black",size=5), axis.ticks.x = element_blank(),axis.title.y=element_blank(),axis.title.x=element_blank())+
+  coord_flip() + scale_y_continuous(limits = c(-2.5, 10.25),breaks = c(-2.5,0,2.5,5,7.5,10))  +
+  geom_hline(colour = "grey20",yintercept = 0,size=0.3) +
+  scale_fill_gradient2(low = "red", mid="#f7fbff",high = "#2171b5") +
+  facet_grid( . ~ type)
+```
+
+END
+
